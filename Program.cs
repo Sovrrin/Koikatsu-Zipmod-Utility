@@ -7,7 +7,7 @@ using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Xml.Linq;
 
-namespace ZipmodRenamer;
+namespace KKZipmodUtility;
 
 static class Program
 {
@@ -58,11 +58,11 @@ class MainForm : Form
     readonly ThemeToggle darkToggle = new();
     readonly ToolTip tip = new();
     readonly Button clearBtn = new() { Text = "Clear", AutoSize = true };
-    readonly Button matcherBtn = new() { Text = "Card matcher...", AutoSize = true };
+    readonly Button checkerBtn = new() { Text = "Card checker...", AutoSize = true };
     readonly Button selAllBtn = new() { Text = "Select all", AutoSize = true };
     readonly Button selNoneBtn = new() { Text = "Select none", AutoSize = true };
     bool refreshing;
-    MatcherForm matcher;
+    CardCheckerForm checker;
     bool darkMode;
     bool suppress = true;
 
@@ -89,13 +89,15 @@ class MainForm : Form
 
     public MainForm()
     {
-        Text = "Zipmod Renamer";
+        Text = "[KK] Zipmod Utility";
+        Icon = AppIcon.Load();
         Width = 1050;
         Height = 650;
         MinimumSize = new Size(800, 450);
 
         list.Columns.Add("Current filename", 350);
         list.Columns.Add("New filename", 420);
+        list.Columns.Add("Folder", 230);
         list.Columns.Add("Status", 200);
 
         var browseBtn = new Button { Text = "Browse...", AutoSize = true };
@@ -104,7 +106,7 @@ class MainForm : Form
         renameBtn.Click += (_, _) => DoRename();
         undoBtn.Click += async (_, _) => await UndoAsync();
         clearBtn.Click += (_, _) => ClearList();
-        matcherBtn.Click += (_, _) => OpenMatcher();
+        checkerBtn.Click += (_, _) => OpenChecker();
         onlyChangesChk.CheckedChanged += (_, _) => RefreshList();
         list.CheckBoxes = true;
         list.ItemChecked += ListItemChecked;
@@ -163,7 +165,7 @@ class MainForm : Form
         btns.Controls.Add(renameBtn);
         btns.Controls.Add(undoBtn);
         btns.Controls.Add(clearBtn);
-        btns.Controls.Add(matcherBtn);
+        btns.Controls.Add(checkerBtn);
         btns.Controls.Add(statusLbl);
         table.Controls.Add(btns, 0, 4);
         table.SetColumnSpan(btns, 3);
@@ -190,7 +192,7 @@ class MainForm : Form
         {
             ApplyTheme(darkToggle.Checked);
             SaveDarkPref(darkToggle.Checked);
-            if (matcher != null && !matcher.IsDisposed) matcher.SetDark(darkToggle.Checked);
+            if (checker != null && !checker.IsDisposed) checker.SetDark(darkToggle.Checked);
         };
 
         suppress = false;
@@ -277,27 +279,32 @@ class MainForm : Form
         renameBtn.Enabled = false;
     }
 
-    void OpenMatcher()
+    void OpenChecker()
     {
-        if (matcher == null || matcher.IsDisposed)
+        if (checker == null || checker.IsDisposed)
         {
-            matcher = new MatcherForm(folderBox.Text.Trim(), darkToggle.Checked);
-            matcher.Show(this);
+            checker = new CardCheckerForm(folderBox.Text.Trim(), darkToggle.Checked);
+            checker.Show(this);
         }
         else
         {
-            matcher.Activate();
+            checker.Activate();
         }
     }
 
     // ------------------------------------------------------------- theming --
 
     static string PrefPath => System.IO.Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "KKZipmodUtility", "theme.txt");
+
+    // Settings location used before the app was renamed
+    static string OldPrefPath => System.IO.Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "ZipmodRenamer", "theme.txt");
 
     static bool LoadDarkPref()
     {
         try { if (File.Exists(PrefPath)) return File.ReadAllText(PrefPath).Trim() == "dark"; } catch { }
+        try { if (File.Exists(OldPrefPath)) return File.ReadAllText(OldPrefPath).Trim() == "dark"; } catch { }
         try
         {
             using var k = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize");
@@ -457,9 +464,11 @@ class MainForm : Form
     // Make the last column fill the remaining width (no blank column on the right)
     void FitLastColumn()
     {
-        if (list.Columns.Count < 3) return;
-        int used = list.Columns[0].Width + list.Columns[1].Width;
-        list.Columns[2].Width = Math.Max(120, list.ClientSize.Width - used);
+        int last = list.Columns.Count - 1;
+        if (last < 1) return;
+        int used = 0;
+        for (int i = 0; i < last; i++) used += list.Columns[i].Width;
+        list.Columns[last].Width = Math.Max(120, list.ClientSize.Width - used);
     }
 
     // Builds the pattern text from the checkboxes, then refreshes the preview
@@ -667,8 +676,10 @@ class MainForm : Form
         {
             bool changed = it.NewPath != it.Path;
             if (onlyChangesChk.Checked && !changed && !it.Status.StartsWith("Skipped")) continue;
-            var row = new ListViewItem(System.IO.Path.GetRelativePath(root, it.Path));
-            row.SubItems.Add(changed ? System.IO.Path.GetRelativePath(root, it.NewPath) : "");
+            var row = new ListViewItem(System.IO.Path.GetFileName(it.Path));
+            row.SubItems.Add(changed ? System.IO.Path.GetFileName(it.NewPath) : "");
+            string rel = System.IO.Path.GetRelativePath(root, System.IO.Path.GetDirectoryName(it.Path));
+            row.SubItems.Add(rel == "." ? "" : rel);
             row.SubItems.Add(it.Status);
             row.Tag = it;
             row.Checked = changed && it.Selected;
@@ -995,7 +1006,7 @@ class ThemeToggle : Control
 
 
 // ===================================================================
-//  Card matcher
+//  Card checker
 // ===================================================================
 
 class ZipInfo
@@ -1378,7 +1389,7 @@ static class DarkTheme
     }
 }
 
-class MatcherForm : Form
+class CardCheckerForm : Form
 {
     readonly TextBox folderBox = new() { Dock = DockStyle.Fill };
     readonly Button browseBtn = new() { Text = "Browse...", AutoSize = true };
@@ -1405,10 +1416,11 @@ class MatcherForm : Form
     int indexCount;
     readonly List<CardResult> cards = new();
 
-    public MatcherForm(string modsFolder, bool darkMode)
+    public CardCheckerForm(string modsFolder, bool darkMode)
     {
         dark = darkMode;
-        Text = "Card matcher";
+        Text = "[KK] Zipmod Utility - Card checker";
+        Icon = AppIcon.Load();
         Width = 1150;
         Height = 650;
         MinimumSize = new Size(850, 450);
@@ -1789,5 +1801,24 @@ class MatcherForm : Form
         string msg = $"Copied {copied} zipmod(s)." + (skipped > 0 ? $" Skipped {skipped} that already existed." : "");
         if (errors.Count > 0) msg += $"\n\n{errors.Count} problems:\n" + string.Join("\n", errors.Take(10));
         MessageBox.Show(msg, Text);
+    }
+}
+
+
+// Loads the icon that's embedded in the exe, for the window and taskbar
+static class AppIcon
+{
+    static Icon cached;
+
+    public static Icon Load()
+    {
+        if (cached != null) return cached;
+        try
+        {
+            using var stream = typeof(AppIcon).Assembly.GetManifestResourceStream("icon.ico");
+            if (stream != null) cached = new Icon(stream);
+        }
+        catch { }
+        return cached;
     }
 }

@@ -58,6 +58,7 @@ class MainForm : Form
     readonly ThemeToggle darkToggle = new();
     readonly ToolTip tip = new();
     readonly Button clearBtn = new() { Text = "Clear", AutoSize = true };
+    readonly ContextMenuStrip rowMenu = new();
     readonly Button checkerBtn = new() { Text = "Card checker...", AutoSize = true };
     readonly Button selAllBtn = new() { Text = "Select all", AutoSize = true };
     readonly Button selNoneBtn = new() { Text = "Select none", AutoSize = true };
@@ -109,7 +110,30 @@ class MainForm : Form
         checkerBtn.Click += (_, _) => OpenChecker();
         onlyChangesChk.CheckedChanged += (_, _) => RefreshList();
         list.CheckBoxes = true;
+        ListColumns.Attach(list);
         list.ItemChecked += ListItemChecked;
+
+        // Right-click a file -> open its location
+        var openItem = new ToolStripMenuItem("Open file location");
+        openItem.Click += (_, _) => OpenSelectedLocation();
+        rowMenu.Items.Add(openItem);
+        rowMenu.Opening += (_, e) =>
+        {
+            var hit = list.HitTest(list.PointToClient(Cursor.Position));
+            if (hit.Item != null)
+            {
+                if (!hit.Item.Selected)
+                {
+                    list.SelectedItems.Clear();
+                    hit.Item.Selected = true;
+                }
+            }
+            else if (list.SelectedItems.Count == 0)
+            {
+                e.Cancel = true;
+            }
+        };
+        list.ContextMenuStrip = rowMenu;
         selAllBtn.Click += (_, _) => SetAllChecked(true);
         selNoneBtn.Click += (_, _) => SetAllChecked(false);
 
@@ -269,6 +293,52 @@ class MainForm : Form
         return common;
     }
 
+    void OpenSelectedLocation()
+    {
+        if (list.SelectedItems.Count == 0 || list.SelectedItems[0].Tag is not Item it) return;
+        try
+        {
+            if (File.Exists(it.Path))
+            {
+                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(
+                    "explorer.exe", $"/select,\"{it.Path}\"") { UseShellExecute = true });
+            }
+            else
+            {
+                string dir = System.IO.Path.GetDirectoryName(it.Path);
+                if (dir != null && Directory.Exists(dir))
+                    System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(dir) { UseShellExecute = true });
+                else
+                    MessageBox.Show("That file no longer exists.", Text);
+            }
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show("Couldn't open the location:\n" + ex.Message, Text);
+        }
+    }
+
+    void ApplyMenuTheme()
+    {
+        if (darkMode)
+        {
+            rowMenu.Renderer = new ToolStripProfessionalRenderer(new DarkMenuColors()) { RoundedEdges = false };
+            rowMenu.BackColor = Color.FromArgb(40, 40, 40);
+            rowMenu.ForeColor = Color.FromArgb(230, 230, 230);
+        }
+        else
+        {
+            rowMenu.RenderMode = ToolStripRenderMode.ManagerRenderMode;
+            rowMenu.ResetBackColor();
+            rowMenu.ResetForeColor();
+        }
+        foreach (ToolStripItem item in rowMenu.Items)
+        {
+            if (darkMode) item.ForeColor = Color.FromArgb(230, 230, 230);
+            else item.ResetForeColor();
+        }
+    }
+
     // Empty the list so you can start fresh (the Folder box is left alone)
     void ClearList()
     {
@@ -340,6 +410,7 @@ class MainForm : Form
         list.ForeColor = PageFore;
         list.GridLines = !dark;
         list.OwnerDraw = dark;   // custom drawing only in dark mode; light mode stays fully native
+        ApplyMenuTheme();
         list.Invalidate();
 
         ApplyNative();
@@ -464,11 +535,7 @@ class MainForm : Form
     // Make the last column fill the remaining width (no blank column on the right)
     void FitLastColumn()
     {
-        int last = list.Columns.Count - 1;
-        if (last < 1) return;
-        int used = 0;
-        for (int i = 0; i < last; i++) used += list.Columns[i].Width;
-        list.Columns[last].Width = Math.Max(120, list.ClientSize.Width - used);
+        ListColumns.Fit(list);
     }
 
     // Builds the pattern text from the checkboxes, then refreshes the preview
@@ -1487,6 +1554,7 @@ class CardCheckerForm : Form
         list.SizeChanged += (_, _) => FitLastColumn();
 
         DarkTheme.Attach(list);
+        ListColumns.Attach(list);
 
         AllowDrop = true;
         EnableDrop(this);
@@ -1737,11 +1805,7 @@ class CardCheckerForm : Form
 
     void FitLastColumn()
     {
-        int last = list.Columns.Count - 1;
-        if (last < 1) return;
-        int used = 0;
-        for (int i = 0; i < last; i++) used += list.Columns[i].Width;
-        list.Columns[last].Width = Math.Max(150, list.ClientSize.Width - used);
+        ListColumns.Fit(list);
     }
 
     IEnumerable<string> AllNeededGuids() =>
@@ -1821,4 +1885,73 @@ static class AppIcon
         catch { }
         return cached;
     }
+}
+
+
+// Column sizing: columns can't be made narrower than their header text,
+// and the last column always stretches to fill the list (so no blank strip appears).
+static class ListColumns
+{
+    static readonly HashSet<ListView> fitting = new();
+
+    static int MinWidth(ListView lv, int index) =>
+        TextRenderer.MeasureText(lv.Columns[index].Text, lv.Font, Size.Empty, TextFormatFlags.NoPadding).Width + 22;
+
+    public static void Attach(ListView lv)
+    {
+        lv.ColumnWidthChanging += (s, e) =>
+        {
+            int min = MinWidth(lv, e.ColumnIndex);
+            if (e.NewWidth < min)
+            {
+                e.Cancel = true;
+                e.NewWidth = min;
+            }
+        };
+        lv.ColumnWidthChanged += (s, e) => Fit(lv);
+        lv.ClientSizeChanged += (s, e) => Fit(lv);
+    }
+
+    public static void Fit(ListView lv)
+    {
+        int n = lv.Columns.Count;
+        if (n < 2 || fitting.Contains(lv)) return;
+        fitting.Add(lv);
+        try
+        {
+            int used = 0;
+            for (int i = 0; i < n - 1; i++)
+            {
+                int min = MinWidth(lv, i);
+                if (lv.Columns[i].Width < min) lv.Columns[i].Width = min;
+                used += lv.Columns[i].Width;
+            }
+            int width = Math.Max(MinWidth(lv, n - 1), lv.ClientSize.Width - used);
+            if (lv.Columns[n - 1].Width != width) lv.Columns[n - 1].Width = width;
+        }
+        finally
+        {
+            fitting.Remove(lv);
+        }
+    }
+}
+
+// Dark colors for the right-click menu
+class DarkMenuColors : ProfessionalColorTable
+{
+    static readonly Color Back = Color.FromArgb(40, 40, 40);
+    static readonly Color Hot = Color.FromArgb(62, 76, 102);
+    static readonly Color Line = Color.FromArgb(85, 85, 85);
+
+    public override Color ToolStripDropDownBackground => Back;
+    public override Color ImageMarginGradientBegin => Back;
+    public override Color ImageMarginGradientMiddle => Back;
+    public override Color ImageMarginGradientEnd => Back;
+    public override Color MenuBorder => Line;
+    public override Color MenuItemBorder => Hot;
+    public override Color MenuItemSelected => Hot;
+    public override Color MenuItemSelectedGradientBegin => Hot;
+    public override Color MenuItemSelectedGradientEnd => Hot;
+    public override Color SeparatorDark => Line;
+    public override Color SeparatorLight => Line;
 }

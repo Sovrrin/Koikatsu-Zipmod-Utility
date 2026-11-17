@@ -6,8 +6,9 @@
     <UseWindowsForms>true</UseWindowsForms>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>disable</Nullable>
-    <AssemblyName>ZipmodRenamer</AssemblyName>
-    <RootNamespace>ZipmodRenamer</RootNamespace>
+    <AssemblyName>KK Zipmod Utility</AssemblyName>
+    <RootNamespace>KKZipmodUtility</RootNamespace>
+    <ApplicationIcon>icon.ico</ApplicationIcon>
 
     <!-- One standalone exe, no .NET install needed on the target PC -->
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
@@ -17,5 +18,9 @@
     <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
     <PublishTrimmed>false</PublishTrimmed>
   </PropertyGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="icon.ico" LogicalName="icon.ico" />
+  </ItemGroup>
 
 </Project>

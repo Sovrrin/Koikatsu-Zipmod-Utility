@@ -60,10 +60,12 @@ class MainForm : Form
     readonly Button clearBtn = new() { Text = "Clear", AutoSize = true };
     readonly ContextMenuStrip rowMenu = new();
     readonly Button checkerBtn = new() { Text = "Card checker...", AutoSize = true };
+    readonly Button dupBtn = new() { Text = "Duplicate checker...", AutoSize = true };
     readonly Button selAllBtn = new() { Text = "Select all", AutoSize = true };
     readonly Button selNoneBtn = new() { Text = "Select none", AutoSize = true };
     bool refreshing;
     CardCheckerForm checker;
+    DuplicateCheckerForm dupChecker;
     bool darkMode;
     bool suppress = true;
 
@@ -108,6 +110,7 @@ class MainForm : Form
         undoBtn.Click += async (_, _) => await UndoAsync();
         clearBtn.Click += (_, _) => ClearList();
         checkerBtn.Click += (_, _) => OpenChecker();
+        dupBtn.Click += (_, _) => OpenDuplicateChecker();
         onlyChangesChk.CheckedChanged += (_, _) => RefreshList();
         list.CheckBoxes = true;
         ListColumns.Attach(list);
@@ -190,6 +193,7 @@ class MainForm : Form
         btns.Controls.Add(undoBtn);
         btns.Controls.Add(clearBtn);
         btns.Controls.Add(checkerBtn);
+        btns.Controls.Add(dupBtn);
         btns.Controls.Add(statusLbl);
         table.Controls.Add(btns, 0, 4);
         table.SetColumnSpan(btns, 3);
@@ -217,6 +221,7 @@ class MainForm : Form
             ApplyTheme(darkToggle.Checked);
             SaveDarkPref(darkToggle.Checked);
             if (checker != null && !checker.IsDisposed) checker.SetDark(darkToggle.Checked);
+            if (dupChecker != null && !dupChecker.IsDisposed) dupChecker.SetDark(darkToggle.Checked);
         };
 
         suppress = false;
@@ -347,6 +352,19 @@ class MainForm : Form
         list.Items.Clear();
         statusLbl.Text = "";
         renameBtn.Enabled = false;
+    }
+
+    void OpenDuplicateChecker()
+    {
+        if (dupChecker == null || dupChecker.IsDisposed)
+        {
+            dupChecker = new DuplicateCheckerForm(folderBox.Text.Trim(), darkToggle.Checked);
+            dupChecker.Show(this);
+        }
+        else
+        {
+            dupChecker.Activate();
+        }
     }
 
     void OpenChecker()
@@ -1444,11 +1462,47 @@ static class DarkTheme
 
         lv.DrawSubItem += (s, e) =>
         {
-            var bgColor = e.Item.Selected ? Color.FromArgb(62, 76, 102) : lv.BackColor;
-            using var bg = new SolidBrush(bgColor);
-            e.Graphics.FillRectangle(bg, e.Bounds);
-            TextRenderer.DrawText(e.Graphics, e.SubItem.Text, lv.Font, Rectangle.Inflate(e.Bounds, -4, 0),
-                e.Item.ForeColor, flags);
+            var bgColor = e.Item.Selected ? Color.FromArgb(62, 76, 102) : e.SubItem.BackColor;
+            Rectangle cell = e.Bounds;
+            bool check = e.ColumnIndex == 0 && lv.CheckBoxes;
+
+            if (check)
+            {
+                // Column 0 includes the checkbox area, so work out the whole cell ourselves
+                var row = e.Item.GetBounds(ItemBoundsPortion.Entire);
+                cell = new Rectangle(row.Left, row.Top, lv.Columns[0].Width, row.Height);
+            }
+
+            using (var bg = new SolidBrush(bgColor))
+                e.Graphics.FillRectangle(bg, cell);
+
+            if (check)
+            {
+                int size = 13;
+                var box = new Rectangle(cell.Left + 4, cell.Top + (cell.Height - size) / 2, size, size);
+                using (var fill = new SolidBrush(Color.FromArgb(32, 32, 32)))
+                    e.Graphics.FillRectangle(fill, box);
+                using (var border = new Pen(Color.FromArgb(150, 150, 150)))
+                    e.Graphics.DrawRectangle(border, box);
+
+                if (e.Item.Checked)
+                {
+                    var old = e.Graphics.SmoothingMode;
+                    e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+                    using (var tick = new Pen(Color.FromArgb(235, 235, 235), 1.8f))
+                        e.Graphics.DrawLines(tick, new[]
+                        {
+                            new Point(box.Left + 3, box.Top + 7),
+                            new Point(box.Left + 5, box.Top + 10),
+                            new Point(box.Left + 10, box.Top + 3)
+                        });
+                    e.Graphics.SmoothingMode = old;
+                }
+                cell = new Rectangle(cell.Left + 22, cell.Top, cell.Width - 22, cell.Height);
+            }
+
+            TextRenderer.DrawText(e.Graphics, e.SubItem.Text, lv.Font, Rectangle.Inflate(cell, -4, 0),
+                e.SubItem.ForeColor, flags);
         };
 
         lv.HandleCreated += (s, e) =>
@@ -1954,4 +2008,599 @@ class DarkMenuColors : ProfessionalColorTable
     public override Color MenuItemSelectedGradientEnd => Hot;
     public override Color SeparatorDark => Line;
     public override Color SeparatorLight => Line;
+}
+
+
+// ===================================================================
+//  Duplicate checker
+// ===================================================================
+
+class DupEntry
+{
+    public string Path, Name, Version, Guid, Hash;
+    public long Size;
+    public DateTime Modified;
+    public int Group;
+    public bool Identical;   // byte-for-byte copy of another file in its group
+    public bool Move;        // ticked to be moved out
+}
+
+class DupBatch
+{
+    public string Time { get; set; }
+    public List<LogEntry> Moves { get; set; } = new();
+}
+
+class DupLog
+{
+    public List<DupBatch> Batches { get; set; } = new();
+}
+
+class DuplicateCheckerForm : Form
+{
+    const string LogName = "zipmod_duplicates_log.json";
+
+    readonly TextBox folderBox = new() { Dock = DockStyle.Fill };
+    readonly Button browseBtn = new() { Text = "Browse...", AutoSize = true };
+    readonly Button scanBtn = new() { Text = "Scan for duplicates", AutoSize = true };
+    readonly Button moveBtn = new() { Text = "Move ticked to...", AutoSize = true };
+    readonly Button undoBtn = new() { Text = "Undo last move", AutoSize = true };
+    readonly Button exactBtn = new() { Text = "Tick exact copies", AutoSize = true };
+    readonly Button extrasBtn = new() { Text = "Tick all extras", AutoSize = true };
+    readonly Button noneBtn = new() { Text = "Untick all", AutoSize = true };
+    readonly Label statusLbl = new() { AutoSize = true, Padding = new Padding(8, 6, 0, 0) };
+    readonly ContextMenuStrip menu = new();
+    readonly ListView list = new()
+    {
+        Dock = DockStyle.Fill,
+        View = View.Details,
+        FullRowSelect = true,
+        GridLines = true,
+        CheckBoxes = true
+    };
+
+    bool dark;
+    bool busy;
+    bool refreshing;
+    List<DupEntry> entries = new();
+
+    public DuplicateCheckerForm(string modsFolder, bool darkMode)
+    {
+        dark = darkMode;
+        Text = "[KK] Zipmod Utility - Duplicate checker";
+        Icon = AppIcon.Load();
+        Width = 1200;
+        Height = 650;
+        MinimumSize = new Size(900, 450);
+        folderBox.Text = modsFolder;
+
+        list.Columns.Add("File", 300);
+        list.Columns.Add("Mod name", 220);
+        list.Columns.Add("Version", 80);
+        list.Columns.Add("Contents", 90);
+        list.Columns.Add("Size", 80);
+        list.Columns.Add("Modified", 130);
+        list.Columns.Add("Folder", 250);
+
+        var table = new TableLayoutPanel
+        {
+            Dock = DockStyle.Top,
+            AutoSize = true,
+            ColumnCount = 3,
+            Padding = new Padding(8)
+        };
+        table.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        table.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        table.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+
+        table.Controls.Add(new Label { Text = "Mods folder:", AutoSize = true, Anchor = AnchorStyles.Left, Padding = new Padding(0, 6, 0, 0) }, 0, 0);
+        table.Controls.Add(folderBox, 1, 0);
+        table.Controls.Add(browseBtn, 2, 0);
+
+        var row1 = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill };
+        row1.Controls.Add(scanBtn);
+        row1.Controls.Add(moveBtn);
+        row1.Controls.Add(undoBtn);
+        table.Controls.Add(row1, 0, 1);
+        table.SetColumnSpan(row1, 3);
+
+        var row2 = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill };
+        row2.Controls.Add(exactBtn);
+        row2.Controls.Add(extrasBtn);
+        row2.Controls.Add(noneBtn);
+        row2.Controls.Add(statusLbl);
+        table.Controls.Add(row2, 0, 2);
+        table.SetColumnSpan(row2, 3);
+
+        var hint = new Label
+        {
+            Text = "Duplicates = the same mod (same GUID) with the same version. \"Identical\" means the files are exact byte-for-byte copies. " +
+                   "Ticked files are moved out (never deleted); one copy of each mod always stays.",
+            AutoSize = true,
+            MaximumSize = new Size(1100, 0),
+            Padding = new Padding(0, 4, 0, 0)
+        };
+        table.Controls.Add(hint, 0, 3);
+        table.SetColumnSpan(hint, 3);
+
+        Controls.Add(list);
+        Controls.Add(table);
+
+        var openItem = new ToolStripMenuItem("Open file location");
+        openItem.Click += (_, _) => OpenLocation();
+        menu.Items.Add(openItem);
+        menu.Opening += (_, e) =>
+        {
+            var hit = list.HitTest(list.PointToClient(Cursor.Position));
+            if (hit.Item != null)
+            {
+                if (!hit.Item.Selected)
+                {
+                    list.SelectedItems.Clear();
+                    hit.Item.Selected = true;
+                }
+            }
+            else if (list.SelectedItems.Count == 0)
+            {
+                e.Cancel = true;
+            }
+        };
+        list.ContextMenuStrip = menu;
+
+        browseBtn.Click += (_, _) => Browse();
+        scanBtn.Click += async (_, _) => await ScanAsync();
+        moveBtn.Click += async (_, _) => await MoveAsync();
+        undoBtn.Click += async (_, _) => await UndoAsync();
+        exactBtn.Click += (_, _) => { TickExact(); Render(); };
+        extrasBtn.Click += (_, _) => { TickExtras(); Render(); };
+        noneBtn.Click += (_, _) => { foreach (var x in entries) x.Move = false; Render(); };
+        list.ItemChecked += ListItemChecked;
+
+        DarkTheme.Attach(list);
+        ListColumns.Attach(list);
+
+        DarkTheme.Apply(this, dark);
+        ApplyMenuTheme();
+        Render();
+    }
+
+    public void SetDark(bool value)
+    {
+        dark = value;
+        DarkTheme.Apply(this, dark);
+        ApplyMenuTheme();
+        Render();
+    }
+
+    protected override void OnHandleCreated(EventArgs e)
+    {
+        base.OnHandleCreated(e);
+        DarkTheme.ApplyNative(this, dark);
+    }
+
+    void ApplyMenuTheme()
+    {
+        if (dark)
+        {
+            menu.Renderer = new ToolStripProfessionalRenderer(new DarkMenuColors()) { RoundedEdges = false };
+            menu.BackColor = Color.FromArgb(40, 40, 40);
+            menu.ForeColor = Color.FromArgb(230, 230, 230);
+        }
+        else
+        {
+            menu.RenderMode = ToolStripRenderMode.ManagerRenderMode;
+            menu.ResetBackColor();
+            menu.ResetForeColor();
+        }
+        foreach (ToolStripItem item in menu.Items)
+        {
+            if (dark) item.ForeColor = Color.FromArgb(230, 230, 230);
+            else item.ResetForeColor();
+        }
+    }
+
+    // ------------------------------------------------------------- helpers --
+
+    static string FormatSize(long bytes)
+    {
+        if (bytes >= 1024L * 1024 * 1024) return (bytes / 1024.0 / 1024 / 1024).ToString("0.##") + " GB";
+        if (bytes >= 1024L * 1024) return (bytes / 1024.0 / 1024).ToString("0.#") + " MB";
+        if (bytes >= 1024) return (bytes / 1024.0).ToString("0") + " KB";
+        return bytes + " B";
+    }
+
+    static string HashFile(string path)
+    {
+        using var fs = File.OpenRead(path);
+        return Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(fs));
+    }
+
+    // The copy we'd keep: newest file date, then the shortest path
+    static DupEntry Best(IEnumerable<DupEntry> group) =>
+        group.OrderByDescending(z => z.Modified).ThenBy(z => z.Path.Length).First();
+
+    void Browse()
+    {
+        using var dlg = new FolderBrowserDialog { Description = "Select your mods folder" };
+        if (dlg.ShowDialog() == DialogResult.OK) folderBox.Text = dlg.SelectedPath;
+    }
+
+    void SetBusy(bool value)
+    {
+        busy = value;
+        foreach (var b in new[] { browseBtn, scanBtn, moveBtn, undoBtn, exactBtn, extrasBtn, noneBtn })
+            b.Enabled = !value;
+    }
+
+    // ---------------------------------------------------------------- scan --
+
+    async Task ScanAsync()
+    {
+        if (busy) return;
+        string folder = folderBox.Text.Trim();
+        if (!Directory.Exists(folder))
+        {
+            MessageBox.Show("Choose a valid mods folder first.", Text);
+            return;
+        }
+
+        SetBusy(true);
+        var progress = new Progress<string>(t => statusLbl.Text = t);
+
+        var result = await Task.Run(() =>
+        {
+            var files = Directory.EnumerateFiles(folder, "*.zipmod",
+                    new EnumerationOptions { RecurseSubdirectories = true, IgnoreInaccessible = true })
+                .Where(f => f.EndsWith(".zipmod", StringComparison.OrdinalIgnoreCase))
+                .ToList();
+
+            var byKey = new Dictionary<string, List<DupEntry>>(StringComparer.OrdinalIgnoreCase);
+            for (int i = 0; i < files.Count; i++)
+            {
+                if (i % 25 == 0) ((IProgress<string>)progress).Report($"Reading {i + 1}/{files.Count}...");
+                try
+                {
+                    var m = MainForm.ReadManifest(files[i]);
+                    if (m["guid"].Length == 0) continue;
+                    var fi = new FileInfo(files[i]);
+                    var entry = new DupEntry
+                    {
+                        Path = files[i],
+                        Name = m["name"],
+                        Version = m["version"],
+                        Guid = m["guid"],
+                        Size = fi.Length,
+                        Modified = fi.LastWriteTime
+                    };
+                    string key = m["guid"] + "|" + m["version"];
+                    if (!byKey.TryGetValue(key, out var bucket)) byKey[key] = bucket = new List<DupEntry>();
+                    bucket.Add(entry);
+                }
+                catch { }
+            }
+
+            var groups = byKey.Values
+                .Where(g => g.Count > 1)
+                .OrderBy(g => g[0].Name, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(g => g[0].Version, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            var flat = new List<DupEntry>();
+            int gi = 0;
+            foreach (var g in groups)
+            {
+                gi++;
+                if (gi % 10 == 0) ((IProgress<string>)progress).Report($"Comparing files {gi}/{groups.Count}...");
+                foreach (var x in g) x.Group = gi;
+
+                // Only files that share a size with another in the group can be identical
+                foreach (var sizeGroup in g.GroupBy(z => z.Size).Where(sg => sg.Count() > 1))
+                    foreach (var x in sizeGroup)
+                    {
+                        try { x.Hash = HashFile(x.Path); } catch { }
+                    }
+
+                foreach (var hashGroup in g.Where(z => z.Hash != null).GroupBy(z => z.Hash).Where(hg => hg.Count() > 1))
+                    foreach (var x in hashGroup) x.Identical = true;
+
+                flat.AddRange(g.OrderByDescending(z => z.Modified).ThenBy(z => z.Path.Length));
+            }
+            return (Entries: flat, Total: files.Count, Groups: groups.Count);
+        });
+
+        entries = result.Entries;
+        TickExact();
+        SetBusy(false);
+        Render();
+
+        if (entries.Count == 0)
+            statusLbl.Text = $"No duplicates found ({result.Total} zipmods checked)";
+    }
+
+    // ------------------------------------------------------------ selection --
+
+    // Exact byte-for-byte copies: keep one of each, tick the rest
+    void TickExact()
+    {
+        foreach (var x in entries) x.Move = false;
+        foreach (var g in entries.GroupBy(z => z.Group))
+            foreach (var hg in g.Where(z => z.Hash != null).GroupBy(z => z.Hash).Where(h => h.Count() > 1))
+            {
+                var keep = Best(hg);
+                foreach (var x in hg) if (x != keep) x.Move = true;
+            }
+    }
+
+    // Every extra copy of the same GUID + version, even if the contents differ
+    void TickExtras()
+    {
+        foreach (var x in entries) x.Move = false;
+        foreach (var g in entries.GroupBy(z => z.Group))
+        {
+            var keep = Best(g);
+            foreach (var x in g) if (x != keep) x.Move = true;
+        }
+    }
+
+    void ListItemChecked(object sender, ItemCheckedEventArgs e)
+    {
+        if (refreshing) return;
+        if (e.Item.Tag is DupEntry d)
+        {
+            d.Move = e.Item.Checked;
+            UpdateSummary();
+        }
+    }
+
+    // ------------------------------------------------------------- display --
+
+    void Render()
+    {
+        string root = folderBox.Text.Trim();
+        var alt = dark ? Color.FromArgb(58, 58, 63) : Color.FromArgb(236, 242, 250);
+        var warn = dark ? Color.FromArgb(240, 180, 90) : Color.DarkOrange;
+
+        refreshing = true;
+        list.BeginUpdate();
+        list.Items.Clear();
+
+        foreach (var x in entries)
+        {
+            var row = new ListViewItem(System.IO.Path.GetFileName(x.Path)) { UseItemStyleForSubItems = false };
+            row.BackColor = x.Group % 2 == 0 ? alt : list.BackColor;
+            row.ForeColor = list.ForeColor;
+            row.Tag = x;
+
+            void Sub(string text, Color? fore = null)
+            {
+                var sub = row.SubItems.Add(text);
+                sub.BackColor = row.BackColor;
+                sub.ForeColor = fore ?? list.ForeColor;
+            }
+
+            string rel = System.IO.Path.GetRelativePath(root, System.IO.Path.GetDirectoryName(x.Path));
+            Sub(x.Name);
+            Sub(x.Version);
+            Sub(x.Identical ? "Identical" : "Different", x.Identical ? null : warn);
+            Sub(FormatSize(x.Size));
+            Sub(x.Modified.ToString("yyyy-MM-dd HH:mm"));
+            Sub(rel == "." ? "" : rel);
+
+            row.Checked = x.Move;
+            list.Items.Add(row);
+        }
+
+        list.EndUpdate();
+        refreshing = false;
+        ListColumns.Fit(list);
+        UpdateSummary();
+    }
+
+    void UpdateSummary()
+    {
+        if (entries.Count == 0) return;
+        int groups = entries.Select(z => z.Group).Distinct().Count();
+        int exact = entries.Count(z => z.Identical);
+        var ticked = entries.Where(z => z.Move).ToList();
+        statusLbl.Text = $"{groups} duplicate group(s), {entries.Count} files ({exact} exact copies).  " +
+                         $"Ticked: {ticked.Count} ({FormatSize(ticked.Sum(z => z.Size))})";
+    }
+
+    void OpenLocation()
+    {
+        if (list.SelectedItems.Count == 0 || list.SelectedItems[0].Tag is not DupEntry x) return;
+        try
+        {
+            if (File.Exists(x.Path))
+                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(
+                    "explorer.exe", $"/select,\"{x.Path}\"") { UseShellExecute = true });
+            else
+                MessageBox.Show("That file no longer exists.", Text);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show("Couldn't open the location:\n" + ex.Message, Text);
+        }
+    }
+
+    // --------------------------------------------------------- move & undo --
+
+    static DupLog LoadLog(string folder)
+    {
+        try
+        {
+            string path = System.IO.Path.Combine(folder, LogName);
+            if (File.Exists(path))
+                return JsonSerializer.Deserialize<DupLog>(File.ReadAllText(path)) ?? new DupLog();
+        }
+        catch { }
+        return new DupLog();
+    }
+
+    static void SaveLog(string folder, DupLog log)
+    {
+        string path = System.IO.Path.Combine(folder, LogName);
+        if (log.Batches.Count == 0)
+        {
+            if (File.Exists(path)) File.Delete(path);
+            return;
+        }
+        File.WriteAllText(path, JsonSerializer.Serialize(log, new JsonSerializerOptions { WriteIndented = true }));
+    }
+
+    async Task MoveAsync()
+    {
+        if (busy || entries.Count == 0) return;
+        string mods = folderBox.Text.Trim();
+        if (!Directory.Exists(mods)) return;
+
+        // Always keep one copy of each mod
+        int protectedGroups = 0;
+        foreach (var g in entries.GroupBy(z => z.Group))
+        {
+            if (g.All(z => z.Move))
+            {
+                Best(g).Move = false;
+                protectedGroups++;
+            }
+        }
+        if (protectedGroups > 0) Render();
+
+        var todo = entries.Where(z => z.Move).ToList();
+        if (todo.Count == 0)
+        {
+            MessageBox.Show("Nothing is ticked.", Text);
+            return;
+        }
+
+        // Suggest a holding folder next to the mods folder (it must be outside it)
+        string modsFull = System.IO.Path.GetFullPath(mods).TrimEnd(System.IO.Path.DirectorySeparatorChar);
+        string parent = System.IO.Path.GetDirectoryName(modsFull);
+        using var dlg = new FolderBrowserDialog
+        {
+            Description = "Choose where to move the duplicate files. Pick a folder OUTSIDE your mods folder.",
+            UseDescriptionForTitle = true,
+            ShowNewFolderButton = true
+        };
+        if (parent != null) dlg.SelectedPath = System.IO.Path.Combine(parent, "Zipmod duplicates");
+        if (dlg.ShowDialog() != DialogResult.OK) return;
+
+        string dest = System.IO.Path.GetFullPath(dlg.SelectedPath).TrimEnd(System.IO.Path.DirectorySeparatorChar);
+        if (dest.Equals(modsFull, StringComparison.OrdinalIgnoreCase) ||
+            dest.StartsWith(modsFull + System.IO.Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+        {
+            MessageBox.Show("That folder is inside your mods folder, so the game would still load these files.\n\n" +
+                            "Pick a folder outside it.", Text);
+            return;
+        }
+
+        string note = protectedGroups > 0
+            ? $"\n\n({protectedGroups} group(s) had every copy ticked, so I unticked one to keep it.)"
+            : "";
+        var confirm = MessageBox.Show(
+            $"Move {todo.Count} file(s) ({FormatSize(todo.Sum(z => z.Size))}) to:\n{dest}\n\n" +
+            "One copy of each mod stays in your mods folder, and you can undo this afterwards." + note,
+            Text, MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+        if (confirm != DialogResult.Yes) return;
+
+        SetBusy(true);
+        statusLbl.Text = "Moving files...";
+        var batch = new DupBatch { Time = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") };
+        var errors = new List<string>();
+
+        await Task.Run(() =>
+        {
+            Directory.CreateDirectory(dest);
+            foreach (var x in todo)
+            {
+                try
+                {
+                    string name = System.IO.Path.GetFileName(x.Path);
+                    string stem = System.IO.Path.GetFileNameWithoutExtension(name);
+                    string target = System.IO.Path.Combine(dest, name);
+                    int n = 2;
+                    while (File.Exists(target))
+                        target = System.IO.Path.Combine(dest, $"{stem} ({n++}).zipmod");
+                    File.Move(x.Path, target);
+                    batch.Moves.Add(new LogEntry { Old = x.Path, New = target });
+                }
+                catch (Exception ex)
+                {
+                    errors.Add($"{System.IO.Path.GetFileName(x.Path)}: {ex.Message}");
+                }
+            }
+        });
+
+        if (batch.Moves.Count > 0)
+        {
+            try
+            {
+                var log = LoadLog(mods);
+                log.Batches.Add(batch);
+                SaveLog(mods, log);
+            }
+            catch { }
+        }
+
+        string msg = $"Moved {batch.Moves.Count} file(s).";
+        if (errors.Count > 0) msg += $"\n\n{errors.Count} problems:\n" + string.Join("\n", errors.Take(10));
+        MessageBox.Show(msg, Text);
+
+        SetBusy(false);
+        await ScanAsync();
+    }
+
+    async Task UndoAsync()
+    {
+        if (busy) return;
+        string mods = folderBox.Text.Trim();
+        var log = LoadLog(mods);
+        if (log.Batches.Count == 0)
+        {
+            MessageBox.Show("No moves to undo for this folder.", Text);
+            return;
+        }
+
+        var batch = log.Batches[^1];
+        var confirm = MessageBox.Show($"Move {batch.Moves.Count} file(s) from {batch.Time} back to where they were?",
+            Text, MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+        if (confirm != DialogResult.Yes) return;
+
+        var failed = new List<LogEntry>();
+        var errors = new List<string>();
+        int restored = 0;
+
+        SetBusy(true);
+        statusLbl.Text = "Restoring files...";
+        await Task.Run(() =>
+        {
+            foreach (var m in batch.Moves)
+            {
+                try
+                {
+                    if (!File.Exists(m.New)) throw new Exception("file not found in the holding folder");
+                    if (File.Exists(m.Old)) throw new Exception("a file with that name already exists there");
+                    Directory.CreateDirectory(System.IO.Path.GetDirectoryName(m.Old));
+                    File.Move(m.New, m.Old);
+                    restored++;
+                }
+                catch (Exception ex)
+                {
+                    failed.Add(m);
+                    errors.Add($"{System.IO.Path.GetFileName(m.Old)}: {ex.Message}");
+                }
+            }
+        });
+
+        if (failed.Count == 0) log.Batches.RemoveAt(log.Batches.Count - 1);
+        else batch.Moves = failed;
+        try { SaveLog(mods, log); } catch { }
+
+        string msg = $"Restored {restored} file(s).";
+        if (errors.Count > 0) msg += $"\n\n{errors.Count} problems:\n" + string.Join("\n", errors.Take(10));
+        MessageBox.Show(msg, Text);
+
+        SetBusy(false);
+        await ScanAsync();
+    }
 }

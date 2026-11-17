@@ -57,6 +57,7 @@ class MainForm : Form
     readonly CheckBox gameChk = new() { Text = "Game", Checked = false, AutoSize = true };
     readonly ThemeToggle darkToggle = new();
     readonly ToolTip tip = new();
+    readonly Button clearBtn = new() { Text = "Clear", AutoSize = true };
     readonly Button matcherBtn = new() { Text = "Card matcher...", AutoSize = true };
     readonly Button selAllBtn = new() { Text = "Select all", AutoSize = true };
     readonly Button selNoneBtn = new() { Text = "Select none", AutoSize = true };
@@ -102,6 +103,7 @@ class MainForm : Form
         scanBtn.Click += async (_, _) => await ScanAsync();
         renameBtn.Click += (_, _) => DoRename();
         undoBtn.Click += async (_, _) => await UndoAsync();
+        clearBtn.Click += (_, _) => ClearList();
         matcherBtn.Click += (_, _) => OpenMatcher();
         onlyChangesChk.CheckedChanged += (_, _) => RefreshList();
         list.CheckBoxes = true;
@@ -160,6 +162,7 @@ class MainForm : Form
         btns.Controls.Add(scanBtn);
         btns.Controls.Add(renameBtn);
         btns.Controls.Add(undoBtn);
+        btns.Controls.Add(clearBtn);
         btns.Controls.Add(matcherBtn);
         btns.Controls.Add(statusLbl);
         table.Controls.Add(btns, 0, 4);
@@ -214,12 +217,64 @@ class MainForm : Form
         if (!scanBtn.Enabled) return;
         if (e.Data.GetData(DataFormats.FileDrop) is not string[] paths || paths.Length == 0) return;
 
-        string first = paths[0];
-        string folder = Directory.Exists(first) ? first : System.IO.Path.GetDirectoryName(first);
-        if (string.IsNullOrEmpty(folder) || !Directory.Exists(folder)) return;
+        // A single folder: scan the whole folder
+        if (paths.Length == 1 && Directory.Exists(paths[0]))
+        {
+            folderBox.Text = paths[0];
+            await ScanAsync();
+            return;
+        }
 
-        folderBox.Text = folder;
-        await ScanAsync();
+        // Otherwise load only exactly what was dropped
+        var opts = new EnumerationOptions { RecurseSubdirectories = recursiveChk.Checked, IgnoreInaccessible = true };
+        var files = new List<string>();
+        foreach (var p in paths)
+        {
+            if (Directory.Exists(p))
+                files.AddRange(Directory.EnumerateFiles(p, "*.zipmod", opts)
+                    .Where(f => f.EndsWith(".zipmod", StringComparison.OrdinalIgnoreCase)));
+            else if (p.EndsWith(".zipmod", StringComparison.OrdinalIgnoreCase) && File.Exists(p))
+                files.Add(p);
+        }
+        files = files.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+
+        if (files.Count == 0)
+        {
+            statusLbl.Text = "No .zipmod files in what was dropped";
+            return;
+        }
+
+        folderBox.Text = CommonFolder(files);
+        await ScanAsync(files);
+    }
+
+    // The deepest folder that contains all the given files
+    static string CommonFolder(List<string> files)
+    {
+        char sep = System.IO.Path.DirectorySeparatorChar;
+        var parts = files.Select(f => System.IO.Path.GetDirectoryName(f).Split(sep)).ToList();
+        var first = parts[0];
+        int n = first.Length;
+        foreach (var p in parts)
+        {
+            int i = 0;
+            while (i < n && i < p.Length && string.Equals(first[i], p[i], StringComparison.OrdinalIgnoreCase)) i++;
+            n = i;
+        }
+        string common = string.Join(sep.ToString(), first.Take(n));
+        if (common.Length == 0) return System.IO.Path.GetDirectoryName(files[0]);
+        if (common.Length == 2 && common[1] == ':') common += sep;   // "D:" -> "D:\"
+        return common;
+    }
+
+    // Empty the list so you can start fresh (the Folder box is left alone)
+    void ClearList()
+    {
+        if (!scanBtn.Enabled) return;   // ignore while a scan is running
+        items = new List<Item>();
+        list.Items.Clear();
+        statusLbl.Text = "";
+        renameBtn.Enabled = false;
     }
 
     void OpenMatcher()
@@ -504,7 +559,7 @@ class MainForm : Form
 
     // --------------------------------------------------------------- scan --
 
-    async Task ScanAsync()
+    async Task ScanAsync(List<string> only = null)
     {
         string root = folderBox.Text.Trim();
         if (!Directory.Exists(root))
@@ -525,10 +580,12 @@ class MainForm : Form
                 RecurseSubdirectories = recursive,
                 IgnoreInaccessible = true
             };
-            var files = Directory.EnumerateFiles(root, "*.zipmod", opts)
-                .Where(f => f.EndsWith(".zipmod", StringComparison.OrdinalIgnoreCase))
-                .OrderBy(f => f, StringComparer.OrdinalIgnoreCase)
-                .ToList();
+            List<string> files = only != null
+                ? only.OrderBy(f => f, StringComparer.OrdinalIgnoreCase).ToList()
+                : Directory.EnumerateFiles(root, "*.zipmod", opts)
+                    .Where(f => f.EndsWith(".zipmod", StringComparison.OrdinalIgnoreCase))
+                    .OrderBy(f => f, StringComparer.OrdinalIgnoreCase)
+                    .ToList();
 
             var result = new List<Item>();
             for (int i = 0; i < files.Count; i++)

@@ -1519,6 +1519,8 @@ class CardCheckerForm : Form
     readonly Button copyFilesBtn = new() { Text = "Copy needed zipmods to...", AutoSize = true };
     readonly CheckBox onlyMissingChk = new() { Text = "Only show missing", AutoSize = true };
     readonly Label statusLbl = new() { AutoSize = true, Padding = new Padding(8, 6, 0, 0) };
+    readonly ContextMenuStrip guidMenu = new();
+    readonly ToolStripMenuItem copyGuidItem = new("Copy GUID");
     readonly ListView list = new()
     {
         Dock = DockStyle.Fill,
@@ -1607,17 +1609,85 @@ class CardCheckerForm : Form
         DarkTheme.Attach(list);
         ListColumns.Attach(list);
 
+        // Right-click (or Ctrl+C) copies the GUID(s) of the selected rows
+        copyGuidItem.Click += (_, _) => CopySelectedGuids();
+        guidMenu.Items.Add(copyGuidItem);
+        guidMenu.Opening += (_, e) =>
+        {
+            var hit = list.HitTest(list.PointToClient(Cursor.Position));
+            if (hit.Item != null && !hit.Item.Selected)
+            {
+                list.SelectedItems.Clear();
+                hit.Item.Selected = true;
+            }
+            int n = SelectedGuids().Count;
+            if (n == 0) { e.Cancel = true; return; }
+            copyGuidItem.Text = n > 1 ? $"Copy {n} GUIDs" : "Copy GUID";
+        };
+        list.ContextMenuStrip = guidMenu;
+        list.KeyDown += (_, e) =>
+        {
+            if (e.Control && e.KeyCode == Keys.C)
+            {
+                CopySelectedGuids();
+                e.Handled = true;
+            }
+        };
+
         AllowDrop = true;
         EnableDrop(this);
 
         DarkTheme.Apply(this, dark);
+        ApplyMenuTheme();
         Render();
+    }
+
+    // The GUID column is index 3; rows without a GUID (errors, "No mods") are skipped
+    List<string> SelectedGuids() =>
+        list.SelectedItems.Cast<ListViewItem>()
+            .Select(r => r.SubItems.Count > 3 ? r.SubItems[3].Text : "")
+            .Where(g => g.Length > 0)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+    void CopySelectedGuids()
+    {
+        var guids = SelectedGuids();
+        if (guids.Count == 0) return;
+        try
+        {
+            Clipboard.SetText(string.Join(Environment.NewLine, guids));
+            statusLbl.Text = guids.Count == 1 ? $"Copied {guids[0]}" : $"Copied {guids.Count} GUIDs";
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show("Couldn't copy to the clipboard:\n" + ex.Message, Text);
+        }
+    }
+
+    void ApplyMenuTheme()
+    {
+        if (dark)
+        {
+            guidMenu.Renderer = new ToolStripProfessionalRenderer(new DarkMenuColors()) { RoundedEdges = false };
+            guidMenu.BackColor = Color.FromArgb(40, 40, 40);
+            guidMenu.ForeColor = Color.FromArgb(230, 230, 230);
+            copyGuidItem.ForeColor = Color.FromArgb(230, 230, 230);
+        }
+        else
+        {
+            guidMenu.RenderMode = ToolStripRenderMode.ManagerRenderMode;
+            guidMenu.ResetBackColor();
+            guidMenu.ResetForeColor();
+            copyGuidItem.ResetForeColor();
+        }
     }
 
     public void SetDark(bool value)
     {
         dark = value;
         DarkTheme.Apply(this, dark);
+        ApplyMenuTheme();
         Render();
     }
 

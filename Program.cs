@@ -24,6 +24,7 @@ class Item
     public string Path;
     public string NewPath;
     public string Status = "";
+    public bool Selected = true;
     public Dictionary<string, string> Info;
 }
 
@@ -57,6 +58,9 @@ class MainForm : Form
     readonly ThemeToggle darkToggle = new();
     readonly ToolTip tip = new();
     readonly Button matcherBtn = new() { Text = "Card matcher...", AutoSize = true };
+    readonly Button selAllBtn = new() { Text = "Select all", AutoSize = true };
+    readonly Button selNoneBtn = new() { Text = "Select none", AutoSize = true };
+    bool refreshing;
     MatcherForm matcher;
     bool darkMode;
     bool suppress = true;
@@ -100,6 +104,10 @@ class MainForm : Form
         undoBtn.Click += async (_, _) => await UndoAsync();
         matcherBtn.Click += (_, _) => OpenMatcher();
         onlyChangesChk.CheckedChanged += (_, _) => RefreshList();
+        list.CheckBoxes = true;
+        list.ItemChecked += ListItemChecked;
+        selAllBtn.Click += (_, _) => SetAllChecked(true);
+        selNoneBtn.Click += (_, _) => SetAllChecked(false);
 
         var table = new TableLayoutPanel
         {
@@ -139,6 +147,8 @@ class MainForm : Form
         var opts = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill };
         opts.Controls.Add(recursiveChk);
         opts.Controls.Add(onlyChangesChk);
+        opts.Controls.Add(selAllBtn);
+        opts.Controls.Add(selNoneBtn);
         table.Controls.Add(opts, 0, 3);
         table.SetColumnSpan(opts, 3);
 
@@ -159,6 +169,10 @@ class MainForm : Form
         Controls.Add(list);
         Controls.Add(table);
 
+        // Drag & drop a folder (or a file inside it) to scan it
+        AllowDrop = true;
+        EnableDrop(this);
+
         // Dark mode setup
         typeof(ListView).GetProperty("DoubleBuffered",
             System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)?.SetValue(list, true);
@@ -178,6 +192,34 @@ class MainForm : Form
 
         suppress = false;
         RebuildPattern();
+    }
+
+    void EnableDrop(Control c)
+    {
+        c.AllowDrop = true;
+        c.DragEnter += OnDragEnterFolder;
+        c.DragDrop += OnDropFolder;
+        foreach (Control child in c.Controls) EnableDrop(child);
+    }
+
+    void OnDragEnterFolder(object sender, DragEventArgs e)
+    {
+        e.Effect = scanBtn.Enabled && e.Data.GetDataPresent(DataFormats.FileDrop)
+            ? DragDropEffects.Copy
+            : DragDropEffects.None;
+    }
+
+    async void OnDropFolder(object sender, DragEventArgs e)
+    {
+        if (!scanBtn.Enabled) return;
+        if (e.Data.GetData(DataFormats.FileDrop) is not string[] paths || paths.Length == 0) return;
+
+        string first = paths[0];
+        string folder = Directory.Exists(first) ? first : System.IO.Path.GetDirectoryName(first);
+        if (string.IsNullOrEmpty(folder) || !Directory.Exists(folder)) return;
+
+        folderBox.Text = folder;
+        await ScanAsync();
     }
 
     void OpenMatcher()
@@ -310,11 +352,51 @@ class MainForm : Form
 
     void ListDrawSubItem(object sender, DrawListViewSubItemEventArgs e)
     {
+        const TextFormatFlags flags = TextFormatFlags.VerticalCenter | TextFormatFlags.Left |
+                                      TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix;
+
         var bgColor = e.Item.Selected ? Color.FromArgb(62, 76, 102) : list.BackColor;
-        using var bg = new SolidBrush(bgColor);
-        e.Graphics.FillRectangle(bg, e.Bounds);
-        TextRenderer.DrawText(e.Graphics, e.SubItem.Text, list.Font, Rectangle.Inflate(e.Bounds, -4, 0),
-            PageFore, TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+        Rectangle cell = e.Bounds;
+        bool firstWithCheck = e.ColumnIndex == 0 && list.CheckBoxes;
+
+        if (firstWithCheck)
+        {
+            // Column 0 includes the checkbox area, so work out the whole cell ourselves
+            var row = e.Item.GetBounds(ItemBoundsPortion.Entire);
+            cell = new Rectangle(row.Left, row.Top, list.Columns[0].Width, row.Height);
+        }
+
+        using (var bg = new SolidBrush(bgColor))
+            e.Graphics.FillRectangle(bg, cell);
+
+        if (firstWithCheck)
+        {
+            int size = 13;
+            var box = new Rectangle(cell.Left + 4, cell.Top + (cell.Height - size) / 2, size, size);
+            using (var fill = new SolidBrush(Color.FromArgb(32, 32, 32)))
+                e.Graphics.FillRectangle(fill, box);
+            using (var border = new Pen(Color.FromArgb(150, 150, 150)))
+                e.Graphics.DrawRectangle(border, box);
+
+            if (e.Item.Checked)
+            {
+                var old = e.Graphics.SmoothingMode;
+                e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+                using (var tick = new Pen(Color.FromArgb(235, 235, 235), 1.8f))
+                    e.Graphics.DrawLines(tick, new[]
+                    {
+                        new Point(box.Left + 3, box.Top + 7),
+                        new Point(box.Left + 5, box.Top + 10),
+                        new Point(box.Left + 10, box.Top + 3)
+                    });
+                e.Graphics.SmoothingMode = old;
+            }
+
+            cell = new Rectangle(cell.Left + 22, cell.Top, cell.Width - 22, cell.Height);
+        }
+
+        TextRenderer.DrawText(e.Graphics, e.SubItem.Text, list.Font, Rectangle.Inflate(cell, -4, 0),
+            PageFore, flags);
     }
 
     // Make the last column fill the remaining width (no blank column on the right)
@@ -359,8 +441,9 @@ class MainForm : Form
     void UpdateSummary()
     {
         int changes = items.Count(i => i.NewPath != i.Path);
-        statusLbl.Text = $"{items.Count} zipmods, {changes} to rename";
-        renameBtn.Enabled = changes > 0;
+        int selected = items.Count(i => i.Selected && i.NewPath != i.Path);
+        statusLbl.Text = $"{items.Count} zipmods, {changes} to rename ({selected} selected)";
+        renameBtn.Enabled = selected > 0;
     }
 
     // ------------------------------------------------------------ helpers --
@@ -520,6 +603,7 @@ class MainForm : Form
     void RefreshList()
     {
         string root = folderBox.Text.Trim();
+        refreshing = true;
         list.BeginUpdate();
         list.Items.Clear();
         foreach (var it in items)
@@ -529,21 +613,81 @@ class MainForm : Form
             var row = new ListViewItem(System.IO.Path.GetRelativePath(root, it.Path));
             row.SubItems.Add(changed ? System.IO.Path.GetRelativePath(root, it.NewPath) : "");
             row.SubItems.Add(it.Status);
+            row.Tag = it;
+            row.Checked = changed && it.Selected;
             list.Items.Add(row);
         }
         list.EndUpdate();
+        refreshing = false;
         FitLastColumn();
     }
 
     // ------------------------------------------------------------- rename --
+
+    void ListItemChecked(object sender, ItemCheckedEventArgs e)
+    {
+        if (refreshing) return;
+        if (e.Item.Tag is Item it)
+        {
+            it.Selected = e.Item.Checked;
+            UpdateSummary();
+        }
+    }
+
+    // Select all / none applies to the rows currently shown that have a pending rename
+    void SetAllChecked(bool value)
+    {
+        refreshing = true;
+        foreach (ListViewItem row in list.Items)
+        {
+            if (row.Tag is Item it && it.NewPath != it.Path)
+            {
+                row.Checked = value;
+                it.Selected = value;
+            }
+        }
+        refreshing = false;
+        UpdateSummary();
+    }
+
+    // Unchecked files stay where they are, so make sure no selected file's new name
+    // collides with a file that isn't moving.
+    static void ResolveConflicts(List<Item> todo)
+    {
+        var moving = new HashSet<string>(todo.Select(t => t.Path), StringComparer.OrdinalIgnoreCase);
+        var taken = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var folder in todo.Select(t => System.IO.Path.GetDirectoryName(t.Path)).Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            try
+            {
+                foreach (var f in Directory.EnumerateFileSystemEntries(folder))
+                    if (!moving.Contains(f)) taken.Add(f);
+            }
+            catch { }
+        }
+
+        foreach (var it in todo)
+        {
+            string dir = System.IO.Path.GetDirectoryName(it.NewPath);
+            string stem = System.IO.Path.GetFileNameWithoutExtension(it.NewPath);
+            string candidate = it.NewPath;
+            int n = 2;
+            while (taken.Contains(candidate))
+                candidate = System.IO.Path.Combine(dir, $"{stem} ({n++}).zipmod");
+            taken.Add(candidate);
+            it.NewPath = candidate;
+        }
+    }
 
     static string TempName(string path) =>
         System.IO.Path.Combine(System.IO.Path.GetDirectoryName(path), $"__tmp_{Guid.NewGuid():N}.zipmod");
 
     void DoRename()
     {
-        var todo = items.Where(i => i.NewPath != i.Path).ToList();
+        var todo = items.Where(i => i.Selected && i.NewPath != i.Path).ToList();
         if (todo.Count == 0) return;
+        ResolveConflicts(todo);
 
         var confirm = MessageBox.Show(
             $"Rename {todo.Count} files?\n\nA log is saved so you can undo this afterwards.\n" +

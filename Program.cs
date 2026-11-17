@@ -1,6 +1,7 @@
 using System.Drawing.Drawing2D;
 using System.IO.Compression;
 using System.Runtime.InteropServices;
+using System.Text;
 using Microsoft.Win32;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -55,6 +56,8 @@ class MainForm : Form
     readonly CheckBox gameChk = new() { Text = "Game", Checked = false, AutoSize = true };
     readonly ThemeToggle darkToggle = new();
     readonly ToolTip tip = new();
+    readonly Button matcherBtn = new() { Text = "Card matcher...", AutoSize = true };
+    MatcherForm matcher;
     bool darkMode;
     bool suppress = true;
 
@@ -95,6 +98,7 @@ class MainForm : Form
         scanBtn.Click += async (_, _) => await ScanAsync();
         renameBtn.Click += (_, _) => DoRename();
         undoBtn.Click += async (_, _) => await UndoAsync();
+        matcherBtn.Click += (_, _) => OpenMatcher();
         onlyChangesChk.CheckedChanged += (_, _) => RefreshList();
 
         var table = new TableLayoutPanel
@@ -146,6 +150,7 @@ class MainForm : Form
         btns.Controls.Add(scanBtn);
         btns.Controls.Add(renameBtn);
         btns.Controls.Add(undoBtn);
+        btns.Controls.Add(matcherBtn);
         btns.Controls.Add(statusLbl);
         table.Controls.Add(btns, 0, 4);
         table.SetColumnSpan(btns, 3);
@@ -168,10 +173,24 @@ class MainForm : Form
         {
             ApplyTheme(darkToggle.Checked);
             SaveDarkPref(darkToggle.Checked);
+            if (matcher != null && !matcher.IsDisposed) matcher.SetDark(darkToggle.Checked);
         };
 
         suppress = false;
         RebuildPattern();
+    }
+
+    void OpenMatcher()
+    {
+        if (matcher == null || matcher.IsDisposed)
+        {
+            matcher = new MatcherForm(folderBox.Text.Trim(), darkToggle.Checked);
+            matcher.Show(this);
+        }
+        else
+        {
+            matcher.Activate();
+        }
     }
 
     // ------------------------------------------------------------- theming --
@@ -370,7 +389,7 @@ class MainForm : Form
         return stem;
     }
 
-    static Dictionary<string, string> ReadManifest(string path)
+    internal static Dictionary<string, string> ReadManifest(string path)
     {
         using var zip = ZipFile.OpenRead(path);
         var entry =
@@ -770,5 +789,804 @@ class ThemeToggle : Control
         using var cut = new SolidBrush(track);
         g.FillEllipse(moon, cx - 6.5f, cy - 6.5f, 13f, 13f);
         g.FillEllipse(cut, cx - 6.5f + 4.2f, cy - 6.5f - 3.2f, 12f, 12f);
+    }
+}
+
+
+// ===================================================================
+//  Card matcher
+// ===================================================================
+
+class ZipInfo
+{
+    public string Path, Name, Version, Author;
+}
+
+class ModRef
+{
+    public string Guid;
+    public int Count;
+    public SortedSet<string> Props = new();
+}
+
+class CardResult
+{
+    public string Path;
+    public string Error;
+    public string Note;
+    public List<ModRef> Mods = new();
+}
+
+// Minimal MessagePack reader (enough to read Koikatsu card headers and extended data)
+static class MsgPack
+{
+    public static object Read(byte[] d)
+    {
+        int p = 0;
+        return Read(d, ref p, 0);
+    }
+
+    static ulong BE(byte[] d, ref int p, int n)
+    {
+        if (p + n > d.Length) throw new Exception("msgpack: unexpected end of data");
+        ulong v = 0;
+        for (int i = 0; i < n; i++) v = (v << 8) | d[p + i];
+        p += n;
+        return v;
+    }
+
+    static string Str(byte[] d, ref int p, int n)
+    {
+        if (n < 0 || p + n > d.Length) throw new Exception("msgpack: bad string length");
+        string s = Encoding.UTF8.GetString(d, p, n);
+        p += n;
+        return s;
+    }
+
+    static byte[] Bin(byte[] d, ref int p, int n)
+    {
+        if (n < 0 || p + n > d.Length) throw new Exception("msgpack: bad binary length");
+        var b = new byte[n];
+        Array.Copy(d, p, b, 0, n);
+        p += n;
+        return b;
+    }
+
+    static List<object> Arr(byte[] d, ref int p, int n, int depth)
+    {
+        var l = new List<object>();
+        for (int i = 0; i < n; i++) l.Add(Read(d, ref p, depth + 1));
+        return l;
+    }
+
+    static Dictionary<string, object> Map(byte[] d, ref int p, int n, int depth)
+    {
+        var m = new Dictionary<string, object>();
+        for (int i = 0; i < n; i++)
+        {
+            object k = Read(d, ref p, depth + 1);
+            object v = Read(d, ref p, depth + 1);
+            m[k?.ToString() ?? "null"] = v;
+        }
+        return m;
+    }
+
+    static object Ext(byte[] d, ref int p, int n)
+    {
+        p += 1; // type byte
+        return Bin(d, ref p, n);
+    }
+
+    static object Read(byte[] d, ref int p, int depth)
+    {
+        if (depth > 64) throw new Exception("msgpack: nesting too deep");
+        if (p >= d.Length) throw new Exception("msgpack: unexpected end of data");
+        byte b = d[p++];
+        int n;
+
+        if (b <= 0x7f) return (long)b;
+        if (b >= 0xe0) return (long)(sbyte)b;
+        if ((b & 0xe0) == 0xa0) return Str(d, ref p, b & 0x1f);
+        if ((b & 0xf0) == 0x90) return Arr(d, ref p, b & 0x0f, depth);
+        if ((b & 0xf0) == 0x80) return Map(d, ref p, b & 0x0f, depth);
+
+        switch (b)
+        {
+            case 0xc0: return null;
+            case 0xc2: return false;
+            case 0xc3: return true;
+
+            case 0xc4: n = (int)BE(d, ref p, 1); return Bin(d, ref p, n);
+            case 0xc5: n = (int)BE(d, ref p, 2); return Bin(d, ref p, n);
+            case 0xc6: n = (int)BE(d, ref p, 4); return Bin(d, ref p, n);
+
+            case 0xc7: n = (int)BE(d, ref p, 1); return Ext(d, ref p, n);
+            case 0xc8: n = (int)BE(d, ref p, 2); return Ext(d, ref p, n);
+            case 0xc9: n = (int)BE(d, ref p, 4); return Ext(d, ref p, n);
+
+            case 0xca: return (double)BitConverter.Int32BitsToSingle((int)BE(d, ref p, 4));
+            case 0xcb: return BitConverter.Int64BitsToDouble((long)BE(d, ref p, 8));
+
+            case 0xcc: return (long)BE(d, ref p, 1);
+            case 0xcd: return (long)BE(d, ref p, 2);
+            case 0xce: return (long)BE(d, ref p, 4);
+            case 0xcf: return (long)BE(d, ref p, 8);
+            case 0xd0: return (long)(sbyte)BE(d, ref p, 1);
+            case 0xd1: return (long)(short)BE(d, ref p, 2);
+            case 0xd2: return (long)(int)BE(d, ref p, 4);
+            case 0xd3: return (long)BE(d, ref p, 8);
+
+            case 0xd4: return Ext(d, ref p, 1);
+            case 0xd5: return Ext(d, ref p, 2);
+            case 0xd6: return Ext(d, ref p, 4);
+            case 0xd7: return Ext(d, ref p, 8);
+            case 0xd8: return Ext(d, ref p, 16);
+
+            case 0xd9: n = (int)BE(d, ref p, 1); return Str(d, ref p, n);
+            case 0xda: n = (int)BE(d, ref p, 2); return Str(d, ref p, n);
+            case 0xdb: n = (int)BE(d, ref p, 4); return Str(d, ref p, n);
+
+            case 0xdc: n = (int)BE(d, ref p, 2); return Arr(d, ref p, n, depth);
+            case 0xdd: n = (int)BE(d, ref p, 4); return Arr(d, ref p, n, depth);
+            case 0xde: n = (int)BE(d, ref p, 2); return Map(d, ref p, n, depth);
+            case 0xdf: n = (int)BE(d, ref p, 4); return Map(d, ref p, n, depth);
+        }
+        throw new Exception("msgpack: unknown type 0x" + b.ToString("x2"));
+    }
+}
+
+// Reads the zipmod references (Sideloader resolve info) out of a Koikatsu character card
+static class CardReader
+{
+    const string UarId = "com.bepis.sideloader.universalautoresolver";
+
+    static long ToLong(object o) => o switch
+    {
+        long l => l,
+        double d => (long)d,
+        _ => 0
+    };
+
+    // Returns the offset just after the PNG's IEND chunk, or -1
+    static int FindPngEnd(byte[] d)
+    {
+        byte[] sig = { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A };
+        if (d.Length < 8) return -1;
+        for (int i = 0; i < 8; i++) if (d[i] != sig[i]) return -1;
+
+        long p = 8;
+        while (p + 8 <= d.Length)
+        {
+            long len = ((long)d[p] << 24) | ((long)d[p + 1] << 16) | ((long)d[p + 2] << 8) | d[p + 3];
+            string type = Encoding.ASCII.GetString(d, (int)p + 4, 4);
+            p += 12 + len;
+            if (type == "IEND") return p <= d.Length ? (int)p : d.Length;
+            if (p > d.Length) return -1;
+        }
+        return -1;
+    }
+
+    public static CardResult Read(string path)
+    {
+        var r = new CardResult { Path = path };
+        try
+        {
+            byte[] data = File.ReadAllBytes(path);
+            int pos = FindPngEnd(data);
+            if (pos < 0) throw new Exception("not a valid PNG file");
+            if (pos >= data.Length) throw new Exception("no card data inside this PNG (not a Koikatsu card)");
+
+            using var ms = new MemoryStream(data, pos, data.Length - pos);
+            using var br = new BinaryReader(ms, Encoding.UTF8);
+
+            br.ReadInt32();                      // product number
+            string marker = br.ReadString();     // e.g. 【KoiKatuChara】
+            if (!marker.StartsWith("【KoiKatu"))
+                throw new Exception("not a Koikatsu card");
+            if (marker.Contains("Clothes"))
+                throw new Exception("outfit/coordinate cards aren't supported yet");
+
+            br.ReadString();                     // card version
+            int faceLen = br.ReadInt32();
+            if (faceLen > 0) ms.Seek(faceLen, SeekOrigin.Current);
+
+            int hdrLen = br.ReadInt32();
+            byte[] hdr = br.ReadBytes(hdrLen);
+            br.ReadInt64();                      // total data length
+            long dataStart = ms.Position;
+
+            // Block header: list of {name, version, pos, size}
+            object root = MsgPack.Read(hdr);
+            List<object> infos = null;
+            if (root is Dictionary<string, object> rd && rd.TryGetValue("lstInfo", out var li)) infos = li as List<object>;
+            else if (root is List<object> rl && rl.Count > 0) infos = rl[0] as List<object> ?? rl;
+            if (infos == null) throw new Exception("couldn't read the card's block list");
+
+            long extPos = -1, extSize = 0;
+            foreach (var inf in infos)
+            {
+                string name = null; long bp = 0, bs = 0;
+                if (inf is Dictionary<string, object> m)
+                {
+                    name = m.GetValueOrDefault("name") as string;
+                    bp = ToLong(m.GetValueOrDefault("pos"));
+                    bs = ToLong(m.GetValueOrDefault("size"));
+                }
+                else if (inf is List<object> a && a.Count >= 4)
+                {
+                    name = a[0] as string; bp = ToLong(a[2]); bs = ToLong(a[3]);
+                }
+                if (name == "KKEx") { extPos = bp; extSize = bs; break; }
+            }
+
+            if (extPos < 0)
+            {
+                r.Note = "No extended data (no modded items)";
+                return r;
+            }
+
+            ms.Position = dataStart + extPos;
+            byte[] ext = br.ReadBytes((int)extSize);
+            var extRoot = MsgPack.Read(ext) as Dictionary<string, object>;
+            if (extRoot == null || !extRoot.TryGetValue(UarId, out var plugin))
+            {
+                r.Note = "No zipmod references found";
+                return r;
+            }
+
+            // PluginData is either [version, {data}] or {"version":..,"data":{..}}
+            Dictionary<string, object> pdata = null;
+            if (plugin is List<object> pl && pl.Count >= 2) pdata = pl[1] as Dictionary<string, object>;
+            else if (plugin is Dictionary<string, object> pm) pdata = pm.GetValueOrDefault("data") as Dictionary<string, object> ?? pm;
+
+            if (pdata == null || !pdata.TryGetValue("info", out var infoObj) || infoObj is not List<object> entries)
+            {
+                r.Note = "No zipmod references found";
+                return r;
+            }
+
+            var map = new Dictionary<string, ModRef>(StringComparer.OrdinalIgnoreCase);
+            foreach (var entry in entries)
+            {
+                object parsed = entry is byte[] bytes ? MsgPack.Read(bytes) : entry;
+                if (parsed is not Dictionary<string, object> ri) continue;
+
+                string guid = (ri.GetValueOrDefault("ModID") ?? ri.GetValueOrDefault("GUID")) as string;
+                if (string.IsNullOrWhiteSpace(guid)) continue;
+
+                if (!map.TryGetValue(guid, out var mr))
+                    map[guid] = mr = new ModRef { Guid = guid };
+                mr.Count++;
+
+                string prop = ri.GetValueOrDefault("Property") as string;
+                if (string.IsNullOrWhiteSpace(prop)) prop = ri.GetValueOrDefault("Slot") as string;
+                if (!string.IsNullOrWhiteSpace(prop)) mr.Props.Add(prop);
+            }
+
+            r.Mods = map.Values.OrderBy(m => m.Guid, StringComparer.OrdinalIgnoreCase).ToList();
+            if (r.Mods.Count == 0) r.Note = "No zipmod references found";
+        }
+        catch (Exception ex)
+        {
+            r.Error = ex.Message;
+        }
+        return r;
+    }
+}
+
+// Dark theme helper for secondary windows
+static class DarkTheme
+{
+    [DllImport("dwmapi.dll")]
+    static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
+
+    [DllImport("uxtheme.dll", CharSet = CharSet.Unicode)]
+    static extern int SetWindowTheme(IntPtr hwnd, string appName, string idList);
+
+    public static Color Back(bool dark) => dark ? Color.FromArgb(32, 32, 32) : SystemColors.Control;
+    public static Color Fore(bool dark) => dark ? Color.FromArgb(230, 230, 230) : SystemColors.ControlText;
+    public static Color Field(bool dark) => dark ? Color.FromArgb(45, 45, 45) : SystemColors.Window;
+
+    public static void Apply(Form form, bool dark)
+    {
+        form.BackColor = Back(dark);
+        form.ForeColor = Fore(dark);
+        Walk(form, dark);
+        ApplyNative(form, dark);
+    }
+
+    static void Walk(Control parent, bool dark)
+    {
+        foreach (Control c in parent.Controls)
+        {
+            switch (c)
+            {
+                case ListView lv:
+                    lv.BackColor = Field(dark);
+                    lv.ForeColor = Fore(dark);
+                    lv.GridLines = !dark;
+                    lv.OwnerDraw = dark;
+                    if (lv.IsHandleCreated) SetWindowTheme(lv.Handle, dark ? "DarkMode_Explorer" : "Explorer", null);
+                    lv.Invalidate();
+                    break;
+                case Button b:
+                    if (dark)
+                    {
+                        b.FlatStyle = FlatStyle.Flat;
+                        b.BackColor = Color.FromArgb(60, 60, 60);
+                        b.ForeColor = Fore(true);
+                        b.FlatAppearance.BorderColor = Color.FromArgb(95, 95, 95);
+                    }
+                    else
+                    {
+                        b.FlatStyle = FlatStyle.Standard;
+                        b.UseVisualStyleBackColor = true;
+                        b.ForeColor = SystemColors.ControlText;
+                    }
+                    break;
+                case TextBox t:
+                    t.BackColor = Field(dark);
+                    t.ForeColor = Fore(dark);
+                    t.BorderStyle = dark ? BorderStyle.FixedSingle : BorderStyle.Fixed3D;
+                    break;
+                default:
+                    c.BackColor = Back(dark);
+                    c.ForeColor = Fore(dark);
+                    break;
+            }
+            Walk(c, dark);
+        }
+    }
+
+    public static void ApplyNative(Form form, bool dark)
+    {
+        if (!form.IsHandleCreated) return;
+        int v = dark ? 1 : 0;
+        DwmSetWindowAttribute(form.Handle, 20, ref v, sizeof(int));
+        DwmSetWindowAttribute(form.Handle, 19, ref v, sizeof(int));
+    }
+
+    // Hook up custom drawing (only used while the list's OwnerDraw is on, i.e. dark mode)
+    public static void Attach(ListView lv)
+    {
+        const TextFormatFlags flags = TextFormatFlags.VerticalCenter | TextFormatFlags.Left |
+                                      TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix;
+
+        lv.DrawColumnHeader += (s, e) =>
+        {
+            using var bg = new SolidBrush(Color.FromArgb(52, 52, 52));
+            using var pen = new Pen(Color.FromArgb(85, 85, 85));
+            e.Graphics.FillRectangle(bg, e.Bounds);
+            e.Graphics.DrawLine(pen, e.Bounds.Right - 1, e.Bounds.Top, e.Bounds.Right - 1, e.Bounds.Bottom - 1);
+            e.Graphics.DrawLine(pen, e.Bounds.Left, e.Bounds.Bottom - 1, e.Bounds.Right, e.Bounds.Bottom - 1);
+            TextRenderer.DrawText(e.Graphics, e.Header.Text, lv.Font, Rectangle.Inflate(e.Bounds, -6, 0),
+                Fore(true), flags);
+        };
+
+        lv.DrawSubItem += (s, e) =>
+        {
+            var bgColor = e.Item.Selected ? Color.FromArgb(62, 76, 102) : lv.BackColor;
+            using var bg = new SolidBrush(bgColor);
+            e.Graphics.FillRectangle(bg, e.Bounds);
+            TextRenderer.DrawText(e.Graphics, e.SubItem.Text, lv.Font, Rectangle.Inflate(e.Bounds, -4, 0),
+                e.Item.ForeColor, flags);
+        };
+
+        lv.HandleCreated += (s, e) =>
+            SetWindowTheme(lv.Handle, lv.OwnerDraw ? "DarkMode_Explorer" : "Explorer", null);
+    }
+}
+
+class MatcherForm : Form
+{
+    readonly TextBox folderBox = new() { Dock = DockStyle.Fill };
+    readonly Button browseBtn = new() { Text = "Browse...", AutoSize = true };
+    readonly Button addBtn = new() { Text = "Add cards...", AutoSize = true };
+    readonly Button addFolderBtn = new() { Text = "Add folder of cards...", AutoSize = true };
+    readonly Button clearBtn = new() { Text = "Clear", AutoSize = true };
+    readonly Button reindexBtn = new() { Text = "Re-scan mods folder", AutoSize = true };
+    readonly Button copyGuidsBtn = new() { Text = "Copy missing GUIDs", AutoSize = true };
+    readonly Button copyFilesBtn = new() { Text = "Copy needed zipmods to...", AutoSize = true };
+    readonly CheckBox onlyMissingChk = new() { Text = "Only show missing", AutoSize = true };
+    readonly Label statusLbl = new() { AutoSize = true, Padding = new Padding(8, 6, 0, 0) };
+    readonly ListView list = new()
+    {
+        Dock = DockStyle.Fill,
+        View = View.Details,
+        FullRowSelect = true,
+        GridLines = true
+    };
+
+    bool dark;
+    bool busy;
+    Dictionary<string, List<ZipInfo>> index;
+    string indexedFolder;
+    int indexCount;
+    readonly List<CardResult> cards = new();
+
+    public MatcherForm(string modsFolder, bool darkMode)
+    {
+        dark = darkMode;
+        Text = "Card matcher";
+        Width = 1150;
+        Height = 650;
+        MinimumSize = new Size(850, 450);
+        folderBox.Text = modsFolder;
+
+        list.Columns.Add("Card", 220);
+        list.Columns.Add("Status", 80);
+        list.Columns.Add("Mod name", 230);
+        list.Columns.Add("GUID", 270);
+        list.Columns.Add("Used for", 170);
+        list.Columns.Add("File", 300);
+
+        var table = new TableLayoutPanel
+        {
+            Dock = DockStyle.Top,
+            AutoSize = true,
+            ColumnCount = 3,
+            Padding = new Padding(8)
+        };
+        table.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        table.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        table.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+
+        table.Controls.Add(new Label { Text = "Mods folder:", AutoSize = true, Anchor = AnchorStyles.Left, Padding = new Padding(0, 6, 0, 0) }, 0, 0);
+        table.Controls.Add(folderBox, 1, 0);
+        table.Controls.Add(browseBtn, 2, 0);
+
+        var row1 = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill };
+        row1.Controls.Add(addBtn);
+        row1.Controls.Add(addFolderBtn);
+        row1.Controls.Add(clearBtn);
+        row1.Controls.Add(reindexBtn);
+        table.Controls.Add(row1, 0, 1);
+        table.SetColumnSpan(row1, 3);
+
+        var row2 = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill };
+        row2.Controls.Add(onlyMissingChk);
+        row2.Controls.Add(copyGuidsBtn);
+        row2.Controls.Add(copyFilesBtn);
+        row2.Controls.Add(statusLbl);
+        table.Controls.Add(row2, 0, 2);
+        table.SetColumnSpan(row2, 3);
+
+        var hint = new Label
+        {
+            Text = "Drag and drop character cards (.png) or folders of cards anywhere on this window.",
+            AutoSize = true,
+            Padding = new Padding(0, 4, 0, 0)
+        };
+        table.Controls.Add(hint, 0, 3);
+        table.SetColumnSpan(hint, 3);
+
+        Controls.Add(list);
+        Controls.Add(table);
+
+        browseBtn.Click += async (_, _) => await BrowseAsync();
+        addBtn.Click += async (_, _) => await AddFilesAsync();
+        addFolderBtn.Click += async (_, _) => await AddFolderAsync();
+        clearBtn.Click += (_, _) => { cards.Clear(); Render(); };
+        reindexBtn.Click += async (_, _) => { await EnsureIndexAsync(true); Render(); };
+        copyGuidsBtn.Click += (_, _) => CopyMissingGuids();
+        copyFilesBtn.Click += (_, _) => CopyNeededFiles();
+        onlyMissingChk.CheckedChanged += (_, _) => Render();
+        list.SizeChanged += (_, _) => FitLastColumn();
+
+        DarkTheme.Attach(list);
+
+        AllowDrop = true;
+        EnableDrop(this);
+
+        DarkTheme.Apply(this, dark);
+        Render();
+    }
+
+    public void SetDark(bool value)
+    {
+        dark = value;
+        DarkTheme.Apply(this, dark);
+        Render();
+    }
+
+    protected override void OnHandleCreated(EventArgs e)
+    {
+        base.OnHandleCreated(e);
+        DarkTheme.ApplyNative(this, dark);
+    }
+
+    // ---------------------------------------------------------- drag & drop --
+
+    void EnableDrop(Control c)
+    {
+        if (c is TextBox) return;
+        c.AllowDrop = true;
+        c.DragEnter += OnDragEnter;
+        c.DragDrop += OnDragDrop;
+        foreach (Control child in c.Controls) EnableDrop(child);
+    }
+
+    void OnDragEnter(object sender, DragEventArgs e)
+    {
+        e.Effect = e.Data.GetDataPresent(DataFormats.FileDrop) ? DragDropEffects.Copy : DragDropEffects.None;
+    }
+
+    async void OnDragDrop(object sender, DragEventArgs e)
+    {
+        if (e.Data.GetData(DataFormats.FileDrop) is string[] paths) await AddPathsAsync(paths);
+    }
+
+    // -------------------------------------------------------------- actions --
+
+    async Task BrowseAsync()
+    {
+        using var dlg = new FolderBrowserDialog { Description = "Select your mods folder" };
+        if (dlg.ShowDialog() != DialogResult.OK) return;
+        folderBox.Text = dlg.SelectedPath;
+        await EnsureIndexAsync(true);
+        Render();
+    }
+
+    async Task AddFilesAsync()
+    {
+        using var dlg = new OpenFileDialog
+        {
+            Title = "Select character cards",
+            Filter = "Koikatsu cards (*.png)|*.png",
+            Multiselect = true
+        };
+        if (dlg.ShowDialog() == DialogResult.OK) await AddPathsAsync(dlg.FileNames);
+    }
+
+    async Task AddFolderAsync()
+    {
+        using var dlg = new FolderBrowserDialog { Description = "Select a folder of character cards" };
+        if (dlg.ShowDialog() == DialogResult.OK) await AddPathsAsync(new[] { dlg.SelectedPath });
+    }
+
+    void SetBusy(bool value)
+    {
+        busy = value;
+        foreach (var b in new[] { browseBtn, addBtn, addFolderBtn, clearBtn, reindexBtn, copyGuidsBtn, copyFilesBtn })
+            b.Enabled = !value;
+    }
+
+    async Task EnsureIndexAsync(bool force)
+    {
+        string folder = folderBox.Text.Trim();
+        if (!Directory.Exists(folder))
+        {
+            index = null;
+            indexedFolder = null;
+            return;
+        }
+        if (!force && index != null && string.Equals(indexedFolder, folder, StringComparison.OrdinalIgnoreCase))
+            return;
+
+        SetBusy(true);
+        var progress = new Progress<string>(t => statusLbl.Text = t);
+
+        var result = await Task.Run(() =>
+        {
+            var idx = new Dictionary<string, List<ZipInfo>>(StringComparer.OrdinalIgnoreCase);
+            var files = Directory.EnumerateFiles(folder, "*.zipmod",
+                    new EnumerationOptions { RecurseSubdirectories = true, IgnoreInaccessible = true })
+                .Where(f => f.EndsWith(".zipmod", StringComparison.OrdinalIgnoreCase))
+                .ToList();
+
+            for (int i = 0; i < files.Count; i++)
+            {
+                if (i % 25 == 0) ((IProgress<string>)progress).Report($"Indexing mods {i + 1}/{files.Count}...");
+                try
+                {
+                    var m = MainForm.ReadManifest(files[i]);
+                    string guid = m["guid"];
+                    if (guid.Length == 0) continue;
+                    if (!idx.TryGetValue(guid, out var l)) idx[guid] = l = new List<ZipInfo>();
+                    l.Add(new ZipInfo { Path = files[i], Name = m["name"], Version = m["version"], Author = m["author"] });
+                }
+                catch { }
+            }
+            return (Index: idx, Count: files.Count);
+        });
+
+        index = result.Index;
+        indexCount = result.Count;
+        indexedFolder = folder;
+        SetBusy(false);
+    }
+
+    async Task AddPathsAsync(IEnumerable<string> paths)
+    {
+        if (busy) return;
+
+        string folder = folderBox.Text.Trim();
+        if (!Directory.Exists(folder))
+        {
+            MessageBox.Show("Choose your mods folder first so the cards can be matched against it.", Text);
+            return;
+        }
+
+        var files = new List<string>();
+        foreach (var p in paths)
+        {
+            if (Directory.Exists(p))
+                files.AddRange(Directory.EnumerateFiles(p, "*.png",
+                    new EnumerationOptions { RecurseSubdirectories = true, IgnoreInaccessible = true }));
+            else if (p.EndsWith(".png", StringComparison.OrdinalIgnoreCase))
+                files.Add(p);
+        }
+
+        files = files
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Where(f => !cards.Any(c => string.Equals(c.Path, f, StringComparison.OrdinalIgnoreCase)))
+            .ToList();
+
+        if (files.Count == 0)
+        {
+            statusLbl.Text = "No new .png cards found";
+            return;
+        }
+
+        await EnsureIndexAsync(false);
+
+        SetBusy(true);
+        statusLbl.Text = $"Reading {files.Count} card(s)...";
+        var read = await Task.Run(() => files.Select(CardReader.Read).ToList());
+        cards.AddRange(read);
+        SetBusy(false);
+        Render();
+    }
+
+    // -------------------------------------------------------------- results --
+
+    static ZipInfo Best(List<ZipInfo> zips) =>
+        zips.OrderByDescending(z => Version.TryParse(z.Version, out var v) ? v : new Version(0, 0)).First();
+
+    static string Join(IEnumerable<string> items, int max)
+    {
+        var l = items.ToList();
+        string s = string.Join("; ", l.Take(max));
+        return l.Count > max ? s + $" (+{l.Count - max} more)" : s;
+    }
+
+    void Render()
+    {
+        bool onlyMissing = onlyMissingChk.Checked;
+        var red = dark ? Color.FromArgb(255, 130, 130) : Color.Firebrick;
+        var orange = dark ? Color.FromArgb(240, 180, 90) : Color.DarkOrange;
+
+        var allGuids = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var missingGuids = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        list.BeginUpdate();
+        list.Items.Clear();
+
+        void AddRow(string card, string status, string mod, string guid, string used, string file, Color? color)
+        {
+            var row = new ListViewItem(card);
+            row.SubItems.Add(status);
+            row.SubItems.Add(mod);
+            row.SubItems.Add(guid);
+            row.SubItems.Add(used);
+            row.SubItems.Add(file);
+            if (color.HasValue) row.ForeColor = color.Value;
+            list.Items.Add(row);
+        }
+
+        foreach (var card in cards)
+        {
+            string cardName = System.IO.Path.GetFileName(card.Path);
+
+            if (card.Error != null)
+            {
+                AddRow(cardName, "Error", card.Error, "", "", "", orange);
+                continue;
+            }
+            if (card.Mods.Count == 0)
+            {
+                if (!onlyMissing) AddRow(cardName, "No mods", card.Note ?? "No zipmod references", "", "", "", null);
+                continue;
+            }
+
+            foreach (var mod in card.Mods)
+            {
+                allGuids.Add(mod.Guid);
+                List<ZipInfo> zips = null;
+                bool known = index != null;
+                bool found = known && index.TryGetValue(mod.Guid, out zips);
+                if (known && !found) missingGuids.Add(mod.Guid);
+
+                if (onlyMissing && (found || !known)) continue;
+
+                string used = Join(mod.Props, 3);
+                if (found)
+                {
+                    var best = Best(zips);
+                    AddRow(cardName, "Found", best.Name, mod.Guid, used,
+                        Join(zips.Select(z => System.IO.Path.GetFileName(z.Path)), 3), null);
+                }
+                else
+                {
+                    AddRow(cardName, known ? "MISSING" : "Unknown", "", mod.Guid, used, "", known ? red : orange);
+                }
+            }
+        }
+
+        list.EndUpdate();
+        FitLastColumn();
+
+        int foundCount = allGuids.Count - missingGuids.Count;
+        statusLbl.Text = cards.Count == 0
+            ? (index != null ? $"{indexCount} zipmods indexed" : "")
+            : $"{cards.Count} card(s), {allGuids.Count} mod(s) needed, {foundCount} found, {missingGuids.Count} missing  ({indexCount} zipmods indexed)";
+    }
+
+    void FitLastColumn()
+    {
+        int last = list.Columns.Count - 1;
+        if (last < 1) return;
+        int used = 0;
+        for (int i = 0; i < last; i++) used += list.Columns[i].Width;
+        list.Columns[last].Width = Math.Max(150, list.ClientSize.Width - used);
+    }
+
+    IEnumerable<string> AllNeededGuids() =>
+        cards.Where(c => c.Error == null)
+             .SelectMany(c => c.Mods)
+             .Select(m => m.Guid)
+             .Distinct(StringComparer.OrdinalIgnoreCase);
+
+    void CopyMissingGuids()
+    {
+        if (index == null)
+        {
+            MessageBox.Show("Choose a valid mods folder first.", Text);
+            return;
+        }
+        var missing = AllNeededGuids().Where(g => !index.ContainsKey(g)).ToList();
+        if (missing.Count == 0)
+        {
+            MessageBox.Show("Nothing is missing.", Text);
+            return;
+        }
+        Clipboard.SetText(string.Join(Environment.NewLine, missing));
+        statusLbl.Text = $"Copied {missing.Count} missing GUID(s) to the clipboard";
+    }
+
+    void CopyNeededFiles()
+    {
+        if (index == null)
+        {
+            MessageBox.Show("Choose a valid mods folder first.", Text);
+            return;
+        }
+        var wanted = AllNeededGuids()
+            .Where(g => index.ContainsKey(g))
+            .Select(g => Best(index[g]).Path)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        if (wanted.Count == 0)
+        {
+            MessageBox.Show("None of the needed zipmods were found in your mods folder.", Text);
+            return;
+        }
+
+        using var dlg = new FolderBrowserDialog { Description = "Choose where to copy the needed zipmods" };
+        if (dlg.ShowDialog() != DialogResult.OK) return;
+
+        int copied = 0, skipped = 0;
+        var errors = new List<string>();
+        foreach (var src in wanted)
+        {
+            string dest = System.IO.Path.Combine(dlg.SelectedPath, System.IO.Path.GetFileName(src));
+            if (File.Exists(dest)) { skipped++; continue; }
+            try { File.Copy(src, dest); copied++; }
+            catch (Exception ex) { errors.Add($"{System.IO.Path.GetFileName(src)}: {ex.Message}"); }
+        }
+
+        string msg = $"Copied {copied} zipmod(s)." + (skipped > 0 ? $" Skipped {skipped} that already existed." : "");
+        if (errors.Count > 0) msg += $"\n\n{errors.Count} problems:\n" + string.Join("\n", errors.Take(10));
+        MessageBox.Show(msg, Text);
     }
 }

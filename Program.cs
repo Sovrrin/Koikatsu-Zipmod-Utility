@@ -54,7 +54,6 @@ class MainForm : Form
     readonly CheckBox nameChk = new() { Text = "Name", Checked = true, AutoSize = true };
     readonly CheckBox versionChk = new() { Text = "Version", Checked = true, AutoSize = true };
     readonly CheckBox guidChk = new() { Text = "GUID", Checked = false, AutoSize = true };
-    readonly CheckBox gameChk = new() { Text = "Game", Checked = false, AutoSize = true };
     readonly ThemeToggle darkToggle = new();
     readonly ToolTip tip = new();
     readonly Button clearBtn = new() { Text = "Clear", AutoSize = true };
@@ -171,7 +170,6 @@ class MainForm : Form
         parts.Controls.Add(nameChk);
         parts.Controls.Add(versionChk);
         parts.Controls.Add(guidChk);
-        parts.Controls.Add(gameChk);
         table.Controls.Add(parts, 0, 2);
         table.SetColumnSpan(parts, 3);
 
@@ -183,7 +181,7 @@ class MainForm : Form
         table.Controls.Add(opts, 0, 3);
         table.SetColumnSpan(opts, 3);
 
-        foreach (var chk in new[] { authorChk, nameChk, versionChk, guidChk, gameChk })
+        foreach (var chk in new[] { authorChk, nameChk, versionChk, guidChk })
             chk.CheckedChanged += (_, _) => RebuildPattern();
         patternBox.TextChanged += (_, _) => Recompute();
 
@@ -564,7 +562,6 @@ class MainForm : Form
         if (nameChk.Checked) p.Add("{name}");
         if (versionChk.Checked) p.Add("v{version}");
         if (guidChk.Checked) p.Add("({guid})");
-        if (gameChk.Checked) p.Add("({game})");
 
         bool old = suppress;
         suppress = true;

@@ -12,6 +12,8 @@ Zipmod Utility is a tool designed to make managing, identifying, and organizing 
 
 - **Duplicate Mod Detection:** Scan your mod collection for duplicate `.zipmod` files, even when they have different filenames. Duplicates are identified by comparing the GUIDs contained within the files, allowing you to easily locate and separate redundant mods.
 
+- **Quick File Access:** Right-click any listed `.zipmod` to quickly open its containing file location.
+
 - **Drag & Drop Support:** Easily load `.zipmod` files and character cards by dragging and dropping them directly into the application.
 
 ## Simplify Your Mod Management
